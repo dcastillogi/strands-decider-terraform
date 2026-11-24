@@ -152,15 +152,3 @@ variable "torch_threads" {
     error_message = "torch_threads must be an integer between 1 and 4."
   }
 }
-
-variable "load_generator" {
-  type        = bool
-  default     = false
-  description = "Create an in-region CPU instance and results bucket that scripts/benchmark.py uses to measure the endpoint over its private address."
-}
-
-variable "load_generator_instance_type" {
-  type        = string
-  default     = "c7i.2xlarge"
-  description = "Instance type of the optional load generator."
-}

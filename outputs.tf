@@ -17,14 +17,6 @@ output "ssm_session_command" {
 }
 
 output "private_endpoint" {
-  description = "Decider endpoint on the instance's private address (reachable from the load generator)"
+  description = "Decider endpoint on the instance's private address (reachable from inside the VPC)"
   value       = "http://${aws_instance.decider.private_ip}:8080/v1/systemone"
-}
-
-output "load_generator_instance_id" {
-  value = var.load_generator ? aws_instance.loadgen[0].id : null
-}
-
-output "results_bucket" {
-  value = var.load_generator ? aws_s3_bucket.results[0].bucket : null
 }

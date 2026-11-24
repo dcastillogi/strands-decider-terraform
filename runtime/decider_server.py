@@ -42,6 +42,7 @@ def create_app(load=load_engine):
     max_batch = int(os.environ.get('DECIDER_MAX_BATCH', '8'))
     wait_ms = float(os.environ.get('DECIDER_BATCH_WAIT_MS', '2'))
     max_tokens = int(os.environ.get('DECIDER_MAX_BATCH_TOKENS', '8192'))
+    shared_state = int(os.environ.get('DECIDER_SHARED_STATE_TOKENS', '512'))
     torch.set_num_threads(int(os.environ.get('DECIDER_TORCH_THREADS', '1')))
     try:
         torch.set_num_interop_threads(1)
@@ -61,7 +62,8 @@ def create_app(load=load_engine):
         engine.evaluate(warmup)
         engine.evaluate(single)
         if batching:
-            adapter = BatchEngine(engine, max_rows=256, max_tokens=max_tokens)
+            adapter = BatchEngine(engine, max_rows=256, max_tokens=max_tokens,
+                                  shared_state_tokens=shared_state)
             for size in sorted({1, 2, max_batch // 2, max_batch} - {0}):
                 adapter.evaluate([warmup] * size)
             torch.cuda.synchronize()
@@ -82,7 +84,7 @@ def create_app(load=load_engine):
                 'inference_workers': 1 if batching else workers,
                 'pending': app.state.pool.pending, 'queue_size': queue_size,
                 'batching': batching, 'max_batch': max_batch, 'batch_wait_ms': wait_ms,
-                'max_batch_tokens': max_tokens}
+                'max_batch_tokens': max_tokens, 'shared_state_tokens': shared_state}
 
     @app.post('/v1/systemone')
     async def systemone(http: Request):

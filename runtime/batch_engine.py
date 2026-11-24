@@ -5,8 +5,12 @@ with upstream's core, runs every (request, question) prompt of a microbatch as o
 under a per-row prefix_bidir mask, and reads the answers with upstream's readout. A full pass
 per question is upstream's reference (`reuse_state=False`); only the batch shape differs.
 
-Requests with images, or whose prompts exceed the batch token budget, use the upstream engine
-unchanged. Only one executor thread may call `evaluate`.
+Some requests use the upstream engine unchanged: requests with images, prompts beyond the batch
+token budget, and requests whose state would be repeated for more than `shared_state_tokens`
+tokens across their questions ((questions - 1) x state). Upstream encodes such a state once and
+runs the questions over its keys and values, which beats repeating it in every row; for short
+states the single full pass wins, because upstream's state-then-questions takes two passes.
+Only one executor thread may call `evaluate`.
 """
 
 
@@ -24,8 +28,10 @@ def prefix_bidir_mask(state_lengths, lengths, width, device=None):
 
 
 class BatchEngine:
-    def __init__(self, engine, max_rows=256, max_tokens=8192, stable_choice_margin=0.05):
+    def __init__(self, engine, max_rows=256, max_tokens=8192, stable_choice_margin=0.05,
+                 shared_state_tokens=512):
         self.engine = engine
+        self.shared_state_tokens = shared_state_tokens
         self.max_rows = max_rows
         self.max_tokens = max_tokens
         self.stable_choice_margin = stable_choice_margin
@@ -82,8 +88,10 @@ class BatchEngine:
             rows = [{'request': index, 'question': name,
                      'ids': list(q.state_ids + q.question_ids), 'state': len(q.state_ids)}
                     for name, q in rendered[index].questions.items()]
-            if max(len(row['ids']) for row in rows) > self.max_tokens:
-                # Long prompts: upstream encodes the state once and batches its questions.
+            repeated_state = (len(rows) - 1) * rows[0]['state']
+            if (max(len(row['ids']) for row in rows) > self.max_tokens
+                    or repeated_state > self.shared_state_tokens):
+                # Upstream encodes the state once and batches the questions over it.
                 del rendered[index]
                 direct.append(index)
             else:

@@ -49,6 +49,12 @@ def tiny_checkpoint(directory):
               str(directory / 'readout.safetensors'))
 
 
+def adapter_render(engine, request):
+    from strands_decider.core import render
+
+    return render(request, engine.tokenizer, max_length=engine.max_length)
+
+
 class BatchEngineTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -98,12 +104,28 @@ class BatchEngineTests(unittest.TestCase):
     def test_small_token_budget_splits_batches_and_routes_long_prompts_upstream(self):
         requests = self.requests()
         expected = [self.engine.evaluate(r).model_dump() for r in requests]
-        adapter = BatchEngine(self.engine, max_rows=3, max_tokens=300)
+        adapter = BatchEngine(self.engine, max_rows=3, max_tokens=300, shared_state_tokens=10**9)
         calls = []
         forward = adapter._forward
         adapter._forward = lambda rows: calls.append(len(rows)) or forward(rows)
         actual = adapter.evaluate(requests)
         self.assertTrue(calls and max(calls) <= 3)
+        for want, got in zip(expected, actual, strict=True):
+            self.assertSameAnswers(want['answers'], got['answers'])
+
+    def test_long_shared_states_use_upstream_engine(self):
+        requests = self.requests()
+        expected = [self.engine.evaluate(r).model_dump() for r in requests]
+        adapter = BatchEngine(self.engine, shared_state_tokens=200)
+        rows = []
+        forward = adapter._forward
+        adapter._forward = lambda batch: rows.extend(batch) or forward(batch)
+        actual = adapter.evaluate(requests)
+        batched = {row['request'] for row in rows}
+        routed = [i for i, r in enumerate(requests)
+                  if (len(r.questions) - 1) * len(next(iter(adapter_render(self.engine, r).questions.values())).state_ids) > 200]
+        self.assertTrue(routed)
+        self.assertFalse(batched & set(routed))
         for want, got in zip(expected, actual, strict=True):
             self.assertSameAnswers(want['answers'], got['answers'])
 
