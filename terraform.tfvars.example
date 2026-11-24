@@ -1,0 +1,17 @@
+allowed_cidr = "203.0.113.10/32"
+vpc_id       = "vpc-0123456789abcdef0"
+subnet_id    = "subnet-0123456789abcdef0"
+
+# instance_type       = "g6.xlarge"
+# model_id            = "StrandsAgents/strands-decider-E2B-gemma4-v2-2611"
+# hf_token_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:hf-token-AbCdEf"
+# wait_for_ready      = true
+
+# inference_workers    = 1
+# inference_queue_size = 256
+# torch_threads        = 1
+# inference_batching   = true
+# inference_max_batch  = 8
+# inference_batch_wait_ms = 2
+# inference_max_batch_tokens = 8192
+# model_processes = 1

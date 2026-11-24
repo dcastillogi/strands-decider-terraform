@@ -1,0 +1,123 @@
+#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y python3-pip curl unzip build-essential
+if ! command -v aws >/dev/null; then
+  curl -s https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscli.zip
+  unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install
+fi
+
+# The model runtime is deployed by Terraform's SSM State Manager association.
+id decider >/dev/null 2>&1 || useradd --system --create-home --home-dir /opt/decider decider
+mkdir -p /etc/decider /opt/decider/hf /opt/decider/triton-cache
+if [ -n "${hf_secret_arn}" ]; then
+  umask 077
+  TOKEN=$(aws secretsmanager get-secret-value --region ${region} \
+    --secret-id "${hf_secret_arn}" --query SecretString --output text)
+  echo "HF_TOKEN=$TOKEN" > /etc/decider/hf.env
+  umask 022
+fi
+chown -R decider:decider /opt/decider
+if ! command -v uv >/dev/null; then
+  curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+fi
+
+# --- envoy -------------------------------------------------------------------
+mkdir -p /etc/envoy
+cat > /etc/envoy/envoy.yaml.tmpl <<'EOF'
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 9901}
+static_resources:
+  listeners:
+    - name: public
+      address:
+        socket_address: {address: 0.0.0.0, port_value: 8080}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: decider
+                route_config:
+                  name: local
+                  virtual_hosts:
+                    - name: decider
+                      domains: ["*"]
+                      routes:
+                        - match: {path: /healthz}
+                          direct_response: {status: 200, body: {inline_string: ok}}
+                          typed_per_filter_config:
+                            envoy.filters.http.rbac:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                        - match: {path: /v1/systemone}
+                          route: {cluster: decider, timeout: 30s}
+                        - match: {prefix: /}
+                          direct_response: {status: 404, body: {inline_string: not found}}
+                http_filters:
+                  - name: envoy.filters.http.rbac
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                      rules:
+                        action: ALLOW
+                        policies:
+                          valid_key:
+                            permissions: [{any: true}]
+                            principals:
+                              - header:
+                                  name: x-api-key
+                                  string_match: {exact: "__API_KEY__"}
+                  - name: envoy.filters.http.buffer
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer
+                      max_request_bytes: 1048576
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: decider
+      type: STATIC
+      connect_timeout: 2s
+      load_assignment:
+        cluster_name: decider
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: 127.0.0.1, port_value: 8001}
+EOF
+
+cat > /usr/local/bin/envoy-render.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+KEY=$(aws secretsmanager get-secret-value --region ${region} \
+  --secret-id ${api_key_secret} --query SecretString --output text \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])')
+umask 077
+sed "s/__API_KEY__/$KEY/" /etc/envoy/envoy.yaml.tmpl > /etc/envoy/envoy.yaml
+chown 101:101 /etc/envoy/envoy.yaml
+EOF
+chmod 755 /usr/local/bin/envoy-render.sh
+
+cat > /etc/systemd/system/envoy.service <<'EOF'
+[Unit]
+Description=Envoy proxy
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+ExecStartPre=/usr/local/bin/envoy-render.sh
+ExecStartPre=-/usr/bin/docker rm -f envoy
+ExecStart=/usr/bin/docker run --rm --name envoy --network host \
+  -v /etc/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro \
+  ${envoy_image} -c /etc/envoy/envoy.yaml
+ExecStop=/usr/bin/docker stop envoy
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now envoy
+

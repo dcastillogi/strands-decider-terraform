@@ -1,0 +1,78 @@
+#!/bin/bash
+set -euo pipefail
+cloud-init status --wait
+exec 9>/var/lock/decider-runtime.lock
+flock 9
+STAGING=$(mktemp -d /opt/decider/runtime.XXXXXX)
+%{ for name, payload in payloads ~}
+base64 -d <<'PAYLOAD' | gzip -d > "$STAGING/${name}"
+${payload}
+PAYLOAD
+%{ endfor ~}
+bash "$STAGING/install.sh"
+# Only activate source after dependency installation succeeds.
+rm -rf /opt/decider/runtime.previous
+if [ -d /opt/decider/runtime ]; then
+  mv /opt/decider/runtime /opt/decider/runtime.previous
+fi
+mv "$STAGING" /opt/decider/runtime
+chown -R decider:decider /opt/decider
+cat > /etc/systemd/system/strands-decider.service <<'UNIT'
+[Unit]
+Description=Strands Decider v2 with bounded cross-request batching
+After=network-online.target
+[Service]
+User=decider
+Environment=HF_HOME=/opt/decider/hf
+Environment=DECIDER_MODEL_ID=${model_id}
+Environment=DECIDER_INFERENCE_WORKERS=${workers}
+Environment=DECIDER_QUEUE_SIZE=${queue_size}
+Environment=DECIDER_TORCH_THREADS=${torch_threads}
+Environment=DECIDER_BATCHING=${batching}
+Environment=DECIDER_MAX_BATCH=${max_batch}
+Environment=DECIDER_BATCH_WAIT_MS=${batch_wait_ms}
+Environment=DECIDER_MAX_BATCH_TOKENS=${max_batch_tokens}
+Environment=DECIDER_MODEL_PROCESSES=${model_processes}
+Environment=OMP_NUM_THREADS=${torch_threads}
+Environment=MKL_NUM_THREADS=${torch_threads}
+Environment=TOKENIZERS_PARALLELISM=false
+EnvironmentFile=-/etc/decider/hf.env
+ExecStart=/opt/decider/.venv/bin/python /opt/decider/runtime/decider_server.py
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable strands-decider
+systemctl restart strands-decider
+if /opt/decider/.venv/bin/python - <<'HEALTH'
+import json
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+def health_check(_):
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3) as response:
+            return json.load(response)
+    except (OSError, ValueError):
+        return {}
+
+ready = set()
+with ThreadPoolExecutor(max_workers=16) as pool:
+    for attempt in range(360):
+        for health in pool.map(health_check, range(64)):
+            if health.get('status') == 'ok' and 'pid' in health:
+                ready.add(health['pid'])
+        if len(ready) >= ${model_processes}:
+            print('decider ready:', health, 'ready processes:', sorted(ready))
+            raise SystemExit(0)
+        time.sleep(5)
+raise SystemExit('not all model processes became ready')
+HEALTH
+then
+  exit 0
+fi
+journalctl -u strands-decider -n 60 --no-pager
+exit 1
